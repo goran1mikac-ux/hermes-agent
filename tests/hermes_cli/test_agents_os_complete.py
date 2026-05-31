@@ -137,9 +137,12 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     assert agents_os.main(["--vault-root", str(vault), "docs", "--json"]) == 0
     docs = _json_out(capsys)
     assert Path(docs["docs_path"]).exists()
+    assert set(docs["docs"].keys()) == {"runtime", "command_reference", "recovery_runbook", "safety_policy"}
     text = Path(docs["docs_path"]).read_text(encoding="utf-8")
     assert "Agents OS" in text
     assert "schema_version: 3" in text
+    for path in docs["docs"].values():
+        assert Path(path).exists()
 
 
 def test_agents_os_close_requires_evidence_or_approved_review(tmp_path, monkeypatch, capsys):
@@ -354,6 +357,20 @@ def test_agents_os_execute_dry_run_does_not_mutate_task_to_review(tmp_path, monk
     assert agents_os.main(["--vault-root", str(vault), "task", "list", "--status", "ready", "--json"]) == 0
     ready = _json_out(capsys)
     assert ready[0]["id"] == "task-dry"
+
+
+
+def test_agents_os_service_adapter_exposes_core_payloads(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+    service = agents_os.AgentsOSService(agents_os.resolve_paths(None))
+    assert service.status_payload()["status"] == "ok"
+    assert service.doctor_payload()["ok"] is True
+    assert service.dashboard_payload()["health"]["ok"] is True
+    assert service.maintenance_payload()["status"] == "ok"
 
 
 

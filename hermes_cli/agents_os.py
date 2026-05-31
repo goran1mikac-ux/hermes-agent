@@ -1369,6 +1369,24 @@ class AgentsOSService:
             schema_version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         return {"status": "ok", "schema_version": schema_version, "agents_os_home": str(self.paths.root), "state_db": str(self.paths.db), "counts": counts}
 
+    def _json_from_command(self, func) -> dict[str, Any]:
+        import contextlib
+        import io
+        buf = io.StringIO()
+        args = argparse.Namespace(vault_root=str(self.paths.vault_root), json=True, markdown=False)
+        with contextlib.redirect_stdout(buf):
+            func(args)
+        return json.loads(buf.getvalue())
+
+    def doctor_payload(self) -> dict[str, Any]:
+        return self._json_from_command(doctor)
+
+    def dashboard_payload(self) -> dict[str, Any]:
+        return self._json_from_command(dashboard)
+
+    def maintenance_payload(self) -> dict[str, Any]:
+        return self._json_from_command(maintenance)
+
 
 def service_status(args: argparse.Namespace) -> int:
     payload = AgentsOSService(resolve_paths(args)).status_payload()
@@ -1381,10 +1399,16 @@ def service_status(args: argparse.Namespace) -> int:
 
 def docs_cmd(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
-    payload = AgentsOSService(paths).status_payload()
-    docs_path = paths.vault_root / "90-docs" / "AGENTS-OS-RUNTIME.md"
-    docs_path.parent.mkdir(parents=True, exist_ok=True)
-    text = textwrap.dedent(
+    service = AgentsOSService(paths)
+    payload = service.status_payload()
+    docs_dir = paths.vault_root / "90-docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    docs_path = docs_dir / "AGENTS-OS-RUNTIME.md"
+    command_reference_path = docs_dir / "COMMAND-REFERENCE.md"
+    recovery_runbook_path = docs_dir / "RECOVERY-RUNBOOK.md"
+    safety_policy_path = docs_dir / "SAFETY-POLICY.md"
+
+    runtime_text = textwrap.dedent(
         f"""
         # Agents OS Runtime
 
@@ -1392,13 +1416,25 @@ def docs_cmd(args: argparse.Namespace) -> int:
         - schema_version: {payload['schema_version']}
         - state_db: {payload['state_db']}
         - agents_os_home: {payload['agents_os_home']}
+        - vault_root: {paths.vault_root}
 
         ## Local API adapter
 
         `AgentsOSService` is an importable local adapter. It does not start a server,
-        send network requests, restart Hermes, or mutate runtime configuration.
+        send network requests, restart Hermes, deploy anything, or mutate runtime configuration.
 
-        ## Safe closeout commands
+        Exposed local payload methods:
+        - `status_payload()`
+        - `doctor_payload()`
+        - `dashboard_payload()`
+        - `maintenance_payload()`
+        """
+    ).strip() + "\n"
+    command_text = textwrap.dedent(
+        """
+        # Agents OS Command Reference
+
+        Safe local verification:
 
         ```bash
         export HERMES_HOME=/home/goran/.hermes-doni-clean
@@ -1407,11 +1443,54 @@ def docs_cmd(args: argparse.Namespace) -> int:
         python -m hermes_cli.agents_os service status --json
         python -m hermes_cli.agents_os dashboard --json
         python -m hermes_cli.agents_os maintenance --json
+        python -m hermes_cli.agents_os mirror validate --json
+        python -m hermes_cli.agents_os docs --json
         ```
+
+        Closeout path:
+        - create/route/execute safe local task
+        - request/set review when needed
+        - close with `agents-os close <task-id> --evidence <path>` or approved `--review-id`
         """
     ).strip() + "\n"
-    docs_path.write_text(text, encoding="utf-8")
-    result = {"status": "ok", "docs_path": str(docs_path), "schema_version": payload["schema_version"]}
+    recovery_text = textwrap.dedent(
+        f"""
+        # Agents OS Recovery Runbook
+
+        1. Set `HERMES_HOME=/home/goran/.hermes-doni-clean`.
+        2. Run `python -m hermes_cli.agents_os doctor --json`.
+        3. If dashboard mirror is missing, run `python -m hermes_cli.agents_os mirror rebuild --json`.
+        4. Re-run `python -m hermes_cli.agents_os mirror validate --json`.
+        5. Treat SQLite DB as runtime authority: `{paths.db}`.
+        6. Treat vault as mirror/read-back only: `{paths.vault_root}`.
+        """
+    ).strip() + "\n"
+    safety_text = textwrap.dedent(
+        """
+        # Agents OS Safety Policy
+
+        Hard boundaries:
+        - no deploy
+        - no gateway restart
+        - no web UI, TUI, daemon, or server process without explicit approval
+        - no credentials, API keys, auth stores, tokens, `.env`, or secrets in reports/dashboard
+        - no Marija, ERO, or OpenClaw memory/auth/session/runtime writes
+        - no `/mnt/d/HermesAgent/home` as active runtime authority
+        - outbound/public/financial/security/destructive work must become approval draft, not execution
+        """
+    ).strip() + "\n"
+
+    docs_path.write_text(runtime_text, encoding="utf-8")
+    command_reference_path.write_text(command_text, encoding="utf-8")
+    recovery_runbook_path.write_text(recovery_text, encoding="utf-8")
+    safety_policy_path.write_text(safety_text, encoding="utf-8")
+    docs = {
+        "runtime": str(docs_path),
+        "command_reference": str(command_reference_path),
+        "recovery_runbook": str(recovery_runbook_path),
+        "safety_policy": str(safety_policy_path),
+    }
+    result = {"status": "ok", "docs_path": str(docs_path), "docs": docs, "schema_version": payload["schema_version"]}
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else str(docs_path))
     return 0
 
