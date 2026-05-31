@@ -96,21 +96,23 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
         "completed_tasks": 1,
         "pending_approvals": 1,
         "failed_executions": 0,
-        "stale_drafts": 2,
+        "stale_drafts": 1,
         "action_required": 2,
     }
     assert dashboard["tasks"][0]["id"] == "task-blocked"
     assert dashboard["agents"][0]["id"] == "doni-local"
     assert dashboard["reviews"][0]["status"] == "approved"
     assert dashboard["snapshots"][0]["label"] == "baseline"
-    run_kinds = {run["status"]: run["kind"] for run in dashboard["runs"]}
-    assert run_kinds["created"] == "draft"
-    assert run_kinds["succeeded"] == "execution"
+    run_kinds = {(run["task_id"], run["status"]): run["kind"] for run in dashboard["runs"]}
+    assert run_kinds[("task-proof", "created")] == "draft_superseded"
+    assert run_kinds[("task-proof", "succeeded")] == "execution"
+    assert run_kinds[("task-approval", "created")] == "draft"
     dashboard_text = Path(dashboard["dashboard_path"]).read_text(encoding="utf-8")
     assert "## Queue summary" in dashboard_text
     assert "action_required: 2" in dashboard_text
     assert "pending_approvals: 1" in dashboard_text
-    assert "stale_drafts: 2" in dashboard_text
+    assert "stale_drafts: 1" in dashboard_text
+    assert "kind=draft_superseded" in dashboard_text
     assert "kind=draft" in dashboard_text
     assert "kind=execution" in dashboard_text
     assert "## Agent registry" in dashboard_text

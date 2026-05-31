@@ -802,8 +802,19 @@ def dashboard(args: argparse.Namespace) -> int:
         """).fetchall()]
         approvals = [row_to_dict(r) for r in conn.execute("SELECT * FROM approvals WHERE status='pending' ORDER BY created_at ASC LIMIT 20").fetchall()]
         runs = [row_to_dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 10").fetchall()]
+        execution_task_ids = {
+            run.get("task_id")
+            for run in runs
+            if run.get("task_id") and (run.get("completed_at") or run.get("status") in {"succeeded", "failed", "blocked", "needs_review"})
+        }
         for run in runs:
-            run["kind"] = "execution" if run.get("completed_at") or run.get("status") in {"succeeded", "failed", "blocked", "needs_review"} else "draft"
+            is_execution = run.get("completed_at") or run.get("status") in {"succeeded", "failed", "blocked", "needs_review"}
+            if is_execution:
+                run["kind"] = "execution"
+            elif run.get("task_id") in execution_task_ids:
+                run["kind"] = "draft_superseded"
+            else:
+                run["kind"] = "draft"
         queue_summary = {
             "open_tasks": sum(1 for task in tasks if task["status"] in {"new", "pending", "routed", "ready", "in_progress", "needs_approval"}),
             "blocked_tasks": sum(1 for task in tasks if task["status"] == "blocked"),
