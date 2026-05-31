@@ -336,6 +336,27 @@ def test_agents_os_mirror_validate_detects_missing_dashboard(tmp_path, monkeypat
 
 
 
+def test_agents_os_execute_dry_run_does_not_mutate_task_to_review(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "agent", "add", "doni-local", "--capabilities", "code", "--json"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "run", "code-task", "dry run", "--task-id", "task-dry"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "route", "task-dry", "--json"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "execute", "task-dry", "--dry-run", "--json"]) == 0
+    dry = _json_out(capsys)
+    assert dry["status"] == "dry_run"
+    assert agents_os.main(["--vault-root", str(vault), "task", "list", "--status", "ready", "--json"]) == 0
+    ready = _json_out(capsys)
+    assert ready[0]["id"] == "task-dry"
+
+
+
 def test_agents_os_execute_blocks_approval_gated_task(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     vault = tmp_path / "vault"

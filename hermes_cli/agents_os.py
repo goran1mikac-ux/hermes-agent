@@ -1202,6 +1202,11 @@ def execute_task(args: argparse.Namespace) -> int:
             return 2
         run_id = f"run-{uuid.uuid4().hex[:8]}"
         now = utc_now()
+        if args.dry_run:
+            log_event(conn, "execution_dry_run", task_id=task_id, run_id=run_id, payload={"status": "dry_run"})
+            conn.commit()
+            print(json.dumps({"task_id": task_id, "run_id": run_id, "status": "dry_run"}, ensure_ascii=False, indent=2))
+            return 0
         log_path = paths.artifacts / "runs" / f"{now.split('T',1)[0]}-{run_id}.md"
         body = f"## Execution log\n\n- task_id: {task_id}\n- workflow: {task['workflow'] or ''}\n- dry_run: {bool(args.dry_run)}\n- status: succeeded\n"
         write_markdown(log_path, f"Run {run_id}", body, {"run_id": run_id, "task_id": task_id, "status": "succeeded", "created_at": now})
