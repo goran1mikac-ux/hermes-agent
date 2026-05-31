@@ -142,6 +142,48 @@ def test_agents_os_complete_runtime_sprints(tmp_path, monkeypatch, capsys):
     assert "schema_version: 3" in text
 
 
+def test_agents_os_close_requires_evidence_or_approved_review(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+
+    assert agents_os.main(["--vault-root", str(vault), "run", "code-task", "close proof", "--task-id", "task-close"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "route", "task-close", "--json"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "execute", "task-close", "--json"]) == 0
+    capsys.readouterr()
+
+    assert agents_os.main(["--vault-root", str(vault), "close", "task-close", "--json"]) == 2
+    rejected = _json_out(capsys)
+    assert rejected["status"] == "error"
+    assert rejected["reason"] == "evidence_or_approved_review_required"
+
+    assert agents_os.main(["--vault-root", str(vault), "review", "request", "task-close", "--kind", "qa", "--json"]) == 0
+    review = _json_out(capsys)
+    assert agents_os.main(["--vault-root", str(vault), "review", "set", review["review_id"], "approved", "--notes", "ok", "--json"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "close", "task-close", "--review-id", review["review_id"], "--json"]) == 0
+    closed = _json_out(capsys)
+    assert closed["status"] == "completed"
+    assert closed["review_id"] == review["review_id"]
+
+    assert agents_os.main(["--vault-root", str(vault), "dashboard", "--json"]) == 0
+    dashboard = _json_out(capsys)
+    assert dashboard["recent_completions"][0]["task_id"] == "task-close"
+    assert dashboard["recent_completions"][0]["review_id"] == review["review_id"]
+
+    assert agents_os.main(["--vault-root", str(vault), "run", "code-task", "evidence proof", "--task-id", "task-evidence"]) == 0
+    capsys.readouterr()
+    assert agents_os.main(["--vault-root", str(vault), "close", "task-evidence", "--evidence", "local proof text", "--json"]) == 0
+    evidence_closed = _json_out(capsys)
+    assert evidence_closed["status"] == "completed"
+    assert evidence_closed["evidence"] == "local proof text"
+
+
+
 def test_agents_os_execute_blocks_approval_gated_task(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     vault = tmp_path / "vault"

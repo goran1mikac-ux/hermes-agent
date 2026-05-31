@@ -829,6 +829,20 @@ def dashboard(args: argparse.Namespace) -> int:
         agents = [row_to_dict(r) for r in conn.execute("SELECT * FROM agents ORDER BY status ASC, created_at ASC LIMIT 20").fetchall()]
         reviews = [row_to_dict(r) for r in conn.execute("SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20").fetchall()]
         snapshots = [row_to_dict(r) for r in conn.execute("SELECT id,label,created_at FROM state_snapshots ORDER BY created_at DESC LIMIT 10").fetchall()]
+        recent_completions = []
+        for row in conn.execute("SELECT * FROM events WHERE event_type='task_closed' ORDER BY created_at DESC LIMIT 10").fetchall():
+            item = row_to_dict(row)
+            try:
+                payload = json.loads(item.get("payload") or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            recent_completions.append({
+                "event_id": item["id"],
+                "task_id": item.get("task_id"),
+                "review_id": payload.get("review_id"),
+                "evidence": payload.get("evidence"),
+                "created_at": item.get("created_at"),
+            })
     lines = [
         "# Agents OS Runtime Dashboard",
         "",
@@ -869,6 +883,13 @@ def dashboard(args: argparse.Namespace) -> int:
         lines.append("- Nema snapshotova.")
     for snapshot in snapshots:
         lines.append(f"- `{snapshot['id']}` {snapshot['label']} created={snapshot['created_at']}")
+    lines.extend(["", "## Recent completions"])
+    if not recent_completions:
+        lines.append("- Nema recent completiona.")
+    for completion in recent_completions:
+        evidence = completion.get("evidence") or "-"
+        review_id = completion.get("review_id") or "-"
+        lines.append(f"- task={completion.get('task_id') or '-'} review={review_id} evidence={evidence}")
     lines.extend(["", "## Zadnji runovi"])
     if not runs:
         lines.append("- Nema runova.")
@@ -892,6 +913,7 @@ def dashboard(args: argparse.Namespace) -> int:
         "agents": agents,
         "reviews": reviews,
         "snapshots": snapshots,
+        "recent_completions": recent_completions,
         "runs": runs,
         "events": events,
     }
@@ -1129,6 +1151,44 @@ def leak_scan_text(text: str) -> int:
     return len(re.findall(r"(?i)(api[_-]?key|token|secret|password|credential)\s*[:=]\s*['\"][^'\"]+", text))
 
 
+def close_task(args: argparse.Namespace) -> int:
+    paths = resolve_paths(args)
+    evidence = (args.evidence or "").strip()
+    review_id = args.review_id
+    with connect(paths) as conn:
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (args.id,)).fetchone()
+        if task is None:
+            payload = {"status": "error", "reason": "task_not_found", "task_id": args.id}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 2
+        if task["approval_required"] or _pending_approval_count(conn, args.id) > 0 or task["status"] == "needs_approval":
+            payload = {"status": "blocked", "reason": "approval_required", "task_id": args.id}
+            log_event(conn, "close_blocked", task_id=args.id, payload={"reason": "approval_required"})
+            conn.commit()
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 2
+        approved_review = None
+        if review_id:
+            approved_review = conn.execute("SELECT * FROM reviews WHERE id=? AND task_id=? AND status='approved'", (review_id, args.id)).fetchone()
+            if approved_review is None:
+                payload = {"status": "error", "reason": "approved_review_not_found", "task_id": args.id, "review_id": review_id}
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 2
+        if not evidence and approved_review is None:
+            payload = {"status": "error", "reason": "evidence_or_approved_review_required", "task_id": args.id}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 2
+        now = utc_now()
+        conn.execute("UPDATE tasks SET status='completed', updated_at=? WHERE id=?", (now, args.id))
+        event_payload = {"evidence": evidence or None, "review_id": review_id}
+        log_event(conn, "task_closed", task_id=args.id, run_id=approved_review["run_id"] if approved_review else None, payload=event_payload)
+        conn.commit()
+    result = {"task_id": args.id, "status": "completed", "evidence": evidence or None, "review_id": review_id}
+    print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else f"{args.id} -> completed")
+    return 0
+
+
+
 def maintenance(args: argparse.Namespace) -> int:
     paths = resolve_paths(args)
     md_args = argparse.Namespace(vault_root=str(paths.vault_root), markdown=True)
@@ -1312,6 +1372,13 @@ def _populate_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=execute_next)
+
+    p = sub.add_parser("close", help="Close a task with evidence or approved review")
+    p.add_argument("id")
+    p.add_argument("--evidence", default="")
+    p.add_argument("--review-id")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=close_task)
 
     review = sub.add_parser("review", help="Manage review gates")
     review_sub = review.add_subparsers(dest="review_command")
