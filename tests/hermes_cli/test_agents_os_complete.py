@@ -281,6 +281,37 @@ def test_agents_os_workflow_schema_v1_show_persists_contract(tmp_path, monkeypat
 
 
 
+def test_agents_os_policy_blocks_credential_paths_and_bad_home(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    assert agents_os.main(["--vault-root", str(vault), "init", "--no-vault"]) == 0
+    capsys.readouterr()
+
+    wf_path = tmp_path / "unsafe-workflow.json"
+    wf_path.write_text(json.dumps({
+        "id": "unsafe",
+        "kind": "implementation",
+        "requires_approval": False,
+        "template": "Unsafe workflow",
+        "route": "doni:direct",
+        "capabilities": ["code"],
+        "allowed_paths": [str(tmp_path / ".env")],
+        "blocked_paths": [],
+    }), encoding="utf-8")
+    assert agents_os.main(["--vault-root", str(vault), "workflow", "validate", str(wf_path), "--json"]) == 2
+    invalid = _json_out(capsys)
+    assert invalid["valid"] is False
+    assert "credential_path:allowed_paths" in invalid["errors"]
+
+    monkeypatch.setenv("AGENTS_OS_HOME", str(tmp_path / ".openclaw" / "agents_os"))
+    assert agents_os.main(["--vault-root", str(vault), "doctor", "--json"]) == 1
+    doctor = _json_out(capsys)
+    assert doctor["checks"]["policy_home_isolated"] is False
+    monkeypatch.delenv("AGENTS_OS_HOME", raising=False)
+
+
+
 def test_agents_os_execute_blocks_approval_gated_task(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     vault = tmp_path / "vault"

@@ -944,7 +944,7 @@ def doctor(args: argparse.Namespace) -> int:
         orphan_runs = conn.execute("SELECT COUNT(*) FROM runs WHERE task_id IS NOT NULL AND task_id != '' AND task_id NOT IN (SELECT id FROM tasks)").fetchone()[0]
     required_tables = ["meta", "tasks", "approvals", "artifacts", "events", "runs", "agents", "workflows", "routing_rules", "reviews", "state_snapshots"]
     orphan_records = orphan_artifacts + orphan_events + orphan_runs
-    policy_home_isolated = str(paths.root).startswith(str(paths.home)) and ".hermes-marija" not in str(paths.root) and ".openclaw" not in str(paths.root)
+    policy_home_isolated = str(paths.root).startswith(str(paths.home)) and ".hermes-marija" not in str(paths.root) and ".openclaw" not in str(paths.root) and "/marija" not in str(paths.root).lower()
     checks = {
         "state_db_exists": paths.db.exists(),
         "schema_version": schema_version,
@@ -1083,6 +1083,14 @@ def agent_remove(args: argparse.Namespace) -> int:
 
 
 
+CREDENTIAL_PATH_MARKERS = (".env", "auth.json", "token", "secret", "credential", "password", "api_key", "apikey")
+
+
+def _credential_like_path(value: str) -> bool:
+    lowered = str(value).lower()
+    return any(marker in lowered for marker in CREDENTIAL_PATH_MARKERS)
+
+
 def workflow_validate_payload(data: dict[str, Any]) -> tuple[bool, list[str]]:
     errors = []
     for key in ["id", "kind", "template"]:
@@ -1090,6 +1098,15 @@ def workflow_validate_payload(data: dict[str, Any]) -> tuple[bool, list[str]]:
             errors.append(f"missing:{key}")
     if not isinstance(data.get("requires_approval", False), bool):
         errors.append("requires_approval_must_be_bool")
+    for field in ["allowed_paths", "blocked_paths"]:
+        values = data.get(field, [])
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            errors.append(f"{field}_must_be_list")
+            continue
+        if any(_credential_like_path(value) for value in values):
+            errors.append(f"credential_path:{field}")
     return not errors, errors
 
 
