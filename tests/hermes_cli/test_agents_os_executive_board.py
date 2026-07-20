@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,12 +11,74 @@ from hermes_cli.agents_os_executive_board import (
     EXECUTIVE_BOARD_SCHEMA_VERSION,
     BoardItem,
     BoardItemKind,
+    ApprovalRecord,
+    ExecutionContext,
+    ExecutiveBoardExecutionGate,
     ExecutiveBoardStore,
+    HMACLocalProofVerifier,
+    PayloadValidationError,
+    ApprovalRejected,
+    canonicalize_action_payload,
     canonical_board_id,
     migrate,
     rollback,
     rollback_plan,
 )
+
+
+NOW = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+
+def _payload(**changes):
+    payload = {
+        "schema_version": 1,
+        "action_type": "deploy_contract_test",
+        "target": "executive-board-fixture",
+        "environment": "local-test",
+        "normalized_parameters": {"dry_run": True, "retries": 2},
+        "artifact_references": ["artifact:plan:sha256:abc"],
+        "risk_class": "R3",
+        "requested_by": "goran",
+        "created_at": NOW.isoformat(),
+        "expires_at": (NOW + timedelta(minutes=10)).isoformat(),
+        "rollback_reference": "rollback:fixture:v1",
+    }
+    payload.update(changes)
+    return payload
+
+
+def _approval(verifier, payload=None, **changes):
+    values = {
+        "approval_id": "approval-1",
+        "payload_hash": canonicalize_action_payload(payload or _payload()).sha256,
+        "actor_id": "goran",
+        "auth_method": "local_hmac",
+        "decision": "approved",
+        "approved_at": NOW.isoformat(),
+        "expires_at": (NOW + timedelta(minutes=5)).isoformat(),
+        "nonce_hash": verifier.hash_nonce("nonce-1"),
+        "risk_class": "R3",
+        "reviewer_id": "goran",
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "reason": "Approved local contract fixture",
+    }
+    values.update(changes)
+    return verifier.sign(ApprovalRecord(**values))
+
+
+def _context(**changes):
+    values = {
+        "request_id": "request-1",
+        "run_id": "run-1",
+        "environment": "local-test",
+        "executor_id": "worker-1",
+        "expected_executable_hash": "sha256:build-1",
+        "actual_executable_hash": "sha256:build-1",
+        "circuit_breaker_closed": True,
+    }
+    values.update(changes)
+    return ExecutionContext(**values)
 
 
 def test_canonical_identity_is_stable_and_kind_scoped():
@@ -119,9 +183,15 @@ def test_rollback_plan_is_read_only_and_rollback_removes_only_board_schema(tmp_p
         plan = rollback_plan(conn)
 
         assert conn.total_changes == before
-        assert plan.tables == ("executive_board_items",)
+        assert plan.tables == (
+            "executive_board_items",
+            "executive_board_consumed_nonces",
+        )
         assert plan.meta_keys == ("executive_board_schema_version",)
-        assert plan.present_tables == ("executive_board_items",)
+        assert plan.present_tables == (
+            "executive_board_items",
+            "executive_board_consumed_nonces",
+        )
 
         rollback(conn)
 
@@ -137,3 +207,123 @@ def test_rollback_plan_is_read_only_and_rollback_removes_only_board_schema(tmp_p
         ).fetchone()[0] == 0
 
         rollback(conn)
+
+
+def test_canonical_payload_is_stable_utf8_sorted_compact_and_hashed():
+    left = _payload(normalized_parameters={"z": 2, "enabled": True, "name": "Žir"})
+    right = dict(reversed(list(left.items())))
+
+    canonical = canonicalize_action_payload(left)
+
+    assert canonical.utf8 == canonicalize_action_payload(right).utf8
+    assert canonical.utf8.decode() == canonical.json
+    assert b'"enabled":true' in canonical.utf8
+    assert b" " not in canonical.utf8
+    assert len(canonical.sha256) == 64
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"ratio": 1.5},
+        {"ratio": float("nan")},
+        {"blob": b"secret"},
+        {1: "not-a-string-key"},
+        {"api_key": "plaintext-secret"},
+        {"password": "plaintext-secret"},
+        {"secret_reference": "vault:item", "token": "plaintext"},
+    ],
+)
+def test_canonical_payload_rejects_unstable_or_secret_values(parameters):
+    with pytest.raises(PayloadValidationError):
+        canonicalize_action_payload(_payload(normalized_parameters=parameters))
+
+
+def test_credential_action_allows_only_reference_and_fingerprint():
+    canonicalize_action_payload(
+        _payload(
+            action_type="credential_rotate",
+            normalized_parameters={
+                "secret_reference": "vault:service/account",
+                "fingerprint": "sha256:abc",
+            },
+        )
+    )
+    with pytest.raises(PayloadValidationError):
+        canonicalize_action_payload(
+            _payload(
+                action_type="credential_rotate",
+                normalized_parameters={"secret_reference": "vault:item", "scope": "extra"},
+            )
+        )
+
+
+def test_fake_decided_by_or_model_claim_is_not_owner_proof(tmp_path):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    unsigned = replace(_approval(verifier), proof="")
+    forged_payload = _payload(decided_by="goran", approved_by="goran", approved_model_call=True)
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        gate = ExecutiveBoardExecutionGate(conn, verifier)
+        with pytest.raises((PayloadValidationError, ApprovalRejected)):
+            gate.authorize_and_consume(forged_payload, unsigned, _context(), now=NOW)
+
+
+def test_approval_record_cannot_store_raw_auth_or_credential_material():
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    stored_fields = vars(_approval(verifier))
+    forbidden = {"nonce", "token", "pin", "session_secret", "credential", "secret"}
+
+    assert forbidden.isdisjoint(stored_fields)
+
+
+@pytest.mark.parametrize(
+    ("payload_change", "approval_change", "context_change"),
+    [
+        ({"target": "tampered"}, {}, {}),
+        ({"artifact_references": ["artifact:other"]}, {}, {}),
+        ({"risk_class": "R2"}, {}, {}),
+        ({"rollback_reference": "rollback:other"}, {}, {}),
+        ({}, {}, {"request_id": "request-other"}),
+        ({}, {}, {"run_id": "run-other"}),
+        ({}, {}, {"environment": "staging"}),
+        ({}, {"expires_at": (NOW - timedelta(seconds=1)).isoformat()}, {}),
+        ({}, {}, {"actual_executable_hash": "sha256:other"}),
+        ({}, {}, {"circuit_breaker_closed": False}),
+    ],
+)
+def test_execution_gate_fails_closed_on_binding_mismatch(
+    tmp_path, payload_change, approval_change, context_change
+):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    original = _payload()
+    approval = _approval(verifier, original, **approval_change)
+    candidate = {**original, **payload_change}
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        gate = ExecutiveBoardExecutionGate(conn, verifier)
+        with pytest.raises(ApprovalRejected):
+            gate.authorize_and_consume(
+                candidate, approval, _context(**context_change), now=NOW
+            )
+
+
+def test_high_risk_reviewer_must_differ_from_executor(tmp_path):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    approval = _approval(verifier)
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        with pytest.raises(ApprovalRejected):
+            ExecutiveBoardExecutionGate(conn, verifier).authorize_and_consume(
+                _payload(), approval, _context(executor_id="goran"), now=NOW
+            )
+
+
+def test_nonce_consumption_is_atomic_and_replay_is_rejected(tmp_path):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    approval = _approval(verifier)
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        gate = ExecutiveBoardExecutionGate(conn, verifier)
+        gate.authorize_and_consume(_payload(), approval, _context(), now=NOW)
+        with pytest.raises(ApprovalRejected, match="nonce"):
+            gate.authorize_and_consume(_payload(), approval, _context(), now=NOW)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executive_board_consumed_nonces"
+        ).fetchone()[0] == 1
