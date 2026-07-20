@@ -37,6 +37,7 @@ def _payload(**changes):
         "environment": "local-test",
         "normalized_parameters": {"dry_run": True, "retries": 2},
         "artifact_references": ["artifact:plan:sha256:abc"],
+        "evidence_hash": "sha256:" + ("a" * 64),
         "risk_class": "R3",
         "requested_by": "goran",
         "created_at": NOW.isoformat(),
@@ -48,9 +49,11 @@ def _payload(**changes):
 
 
 def _approval(verifier, payload=None, **changes):
+    bound_payload = payload or _payload()
     values = {
         "approval_id": "approval-1",
-        "payload_hash": canonicalize_action_payload(payload or _payload()).sha256,
+        "payload_hash": canonicalize_action_payload(bound_payload).sha256,
+        "evidence_hash": bound_payload["evidence_hash"],
         "actor_id": "goran",
         "auth_method": "local_hmac",
         "decision": "approved",
@@ -223,6 +226,15 @@ def test_canonical_payload_is_stable_utf8_sorted_compact_and_hashed():
 
 
 @pytest.mark.parametrize(
+    "evidence_hash",
+    ["", "sha256:abc", "md5:" + ("a" * 32), "sha256:" + ("z" * 64)],
+)
+def test_canonical_payload_requires_a_sha256_evidence_hash(evidence_hash):
+    with pytest.raises(PayloadValidationError, match="evidence_hash"):
+        canonicalize_action_payload(_payload(evidence_hash=evidence_hash))
+
+
+@pytest.mark.parametrize(
     "parameters",
     [
         {"ratio": 1.5},
@@ -281,6 +293,8 @@ def test_approval_record_cannot_store_raw_auth_or_credential_material():
     [
         ({"target": "tampered"}, {}, {}),
         ({"artifact_references": ["artifact:other"]}, {}, {}),
+        ({"evidence_hash": "sha256:" + ("b" * 64)}, {}, {}),
+        ({}, {"evidence_hash": "sha256:" + ("b" * 64)}, {}),
         ({"risk_class": "R2"}, {}, {}),
         ({"rollback_reference": "rollback:other"}, {}, {}),
         ({}, {}, {"request_id": "request-other"}),
@@ -313,6 +327,24 @@ def test_high_risk_reviewer_must_differ_from_executor(tmp_path):
         with pytest.raises(ApprovalRejected):
             ExecutiveBoardExecutionGate(conn, verifier).authorize_and_consume(
                 _payload(), approval, _context(executor_id="goran"), now=NOW
+            )
+
+
+@pytest.mark.parametrize(
+    "approval_factory",
+    [
+        lambda verifier: replace(_approval(verifier), actor_id="not-goran"),
+        lambda verifier: replace(_approval(verifier), reviewer_id="not-goran"),
+        lambda verifier: replace(_approval(verifier), proof=""),
+        lambda verifier: replace(_approval(verifier), proof="0" * 64),
+    ],
+)
+def test_owner_identity_and_proof_fail_closed(tmp_path, approval_factory):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        with pytest.raises(ApprovalRejected):
+            ExecutiveBoardExecutionGate(conn, verifier).authorize_and_consume(
+                _payload(), approval_factory(verifier), _context(), now=NOW
             )
 
 

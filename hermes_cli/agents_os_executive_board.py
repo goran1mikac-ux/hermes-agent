@@ -25,6 +25,7 @@ _PAYLOAD_FIELDS = frozenset(
         "environment",
         "normalized_parameters",
         "artifact_references",
+        "evidence_hash",
         "risk_class",
         "requested_by",
         "created_at",
@@ -32,6 +33,7 @@ _PAYLOAD_FIELDS = frozenset(
         "rollback_reference",
     }
 )
+_SHA256_EVIDENCE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SECRET_KEYS = re.compile(
     r"(?:password|passwd|secret|token|api[_-]?key|credential|private[_-]?key|pin|session[_-]?secret)",
     re.IGNORECASE,
@@ -108,6 +110,10 @@ def canonicalize_action_payload(payload: Mapping[str, Any]) -> CanonicalPayload:
         isinstance(item, str) for item in material["artifact_references"]
     ):
         raise PayloadValidationError("artifact_references must be a list of strings")
+    if not isinstance(material["evidence_hash"], str) or not _SHA256_EVIDENCE.fullmatch(
+        material["evidence_hash"]
+    ):
+        raise PayloadValidationError("evidence_hash must be a lowercase sha256 digest")
     for field in (
         "action_type", "target", "environment", "risk_class", "requested_by",
         "rollback_reference",
@@ -139,6 +145,7 @@ def canonicalize_action_payload(payload: Mapping[str, Any]) -> CanonicalPayload:
 class ApprovalRecord:
     approval_id: str
     payload_hash: str
+    evidence_hash: str
     actor_id: str
     auth_method: str
     decision: str
@@ -225,6 +232,8 @@ class ExecutiveBoardExecutionGate:
             raise reject("Goran is the only final owner authority")
         if canonical.sha256 != approval.payload_hash:
             raise reject("current payload hash does not match approval")
+        if payload["evidence_hash"] != approval.evidence_hash:
+            raise reject("current evidence hash does not match approval")
         if payload["risk_class"] != approval.risk_class:
             raise reject("risk class does not match approval")
         if payload["environment"] != context.environment:
