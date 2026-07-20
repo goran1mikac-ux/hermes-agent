@@ -41,6 +41,22 @@ def ensure_memory_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA)
 
 
+def _insert_compatible(
+    conn: sqlite3.Connection,
+    table: str,
+    values: dict[str, Any],
+) -> None:
+    """Insert only columns exposed by the existing Agents OS schema."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    selected = [(key, value) for key, value in values.items() if key in columns]
+    names = ",".join(key for key, _ in selected)
+    placeholders = ",".join("?" for _ in selected)
+    conn.execute(
+        f"INSERT INTO {table} ({names}) VALUES ({placeholders})",
+        tuple(value for _, value in selected),
+    )
+
+
 def create_memory_object(
     conn: sqlite3.Connection,
     *,
@@ -52,13 +68,25 @@ def create_memory_object(
     producer_runtime: str,
 ) -> dict[str, Any]:
     ensure_memory_schema(conn)
-    digest = hashlib.sha256(body_text.encode()).hexdigest()
+    digest = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
     object_id = f"memory-{uuid.uuid4().hex[:12]}"
-    conn.execute(
-        """INSERT INTO memory_objects
-           (id,title,body_text,scope,profile_id,task_id,run_id,producer_runtime,content_hash)
-           VALUES(?,?,?,'task',?,?,?,?,?)""",
-        (object_id, title, body_text, profile_id, task_id, run_id, producer_runtime, digest),
+    _insert_compatible(
+        conn,
+        "memory_objects",
+        {
+            "id": object_id,
+            "kind": "execution_result",
+            "title": title,
+            "body_text": body_text,
+            "body_uri": None,
+            "content_hash": digest,
+            "scope": "task",
+            "profile_id": profile_id,
+            "project_id": None,
+            "task_id": task_id,
+            "run_id": run_id,
+            "producer_runtime": producer_runtime,
+        },
     )
     return dict(conn.execute("SELECT * FROM memory_objects WHERE id=?", (object_id,)).fetchone())
 
@@ -74,11 +102,23 @@ def create_memory_candidate(
 ) -> dict[str, Any]:
     ensure_memory_schema(conn)
     candidate_id = f"candidate-{uuid.uuid4().hex[:12]}"
-    conn.execute(
-        """INSERT INTO memory_candidates
-           (id,result_text,profile_id,task_id,run_id,producer_runtime)
-           VALUES(?,?,?,?,?,?)""",
-        (candidate_id, result_text, profile_id, task_id, run_id, producer_runtime),
+    result_hash = hashlib.sha256(result_text.encode("utf-8")).hexdigest()
+    _insert_compatible(
+        conn,
+        "memory_candidates",
+        {
+            "id": candidate_id,
+            "result_hash": result_hash,
+            "result_text": result_text,
+            "profile_id": profile_id,
+            "producer_runtime": producer_runtime,
+            "producer_agent": "agents-os",
+            "task_id": task_id,
+            "run_id": run_id,
+            "state": "candidate",
+            "feedback": "",
+            "object_id": None,
+        },
     )
     return dict(conn.execute("SELECT * FROM memory_candidates WHERE id=?", (candidate_id,)).fetchone())
 

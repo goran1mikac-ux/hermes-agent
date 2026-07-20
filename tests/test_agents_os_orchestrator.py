@@ -15,7 +15,11 @@ from hermes_cli.agents_os_execution import (
     RuntimeAdapterRegistry,
     RuntimeInvocation,
 )
-from hermes_cli.agents_os_memory import search_memory
+from hermes_cli.agents_os_memory import (
+    create_memory_candidate,
+    create_memory_object,
+    search_memory,
+)
 from hermes_cli.agents_os_orchestrator import ExecutionCoordinator, execution_projection
 
 
@@ -196,3 +200,75 @@ def test_failed_or_exception_execution_never_leaves_command_running(
         assert command["state"] == "failed"
         assert run["status"] == "failed"
         assert candidate["state"] == "candidate"
+
+
+def test_memory_writes_support_the_existing_agents_os_schema() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE memory_objects (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body_text TEXT NOT NULL DEFAULT '',
+            body_uri TEXT,
+            content_hash TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            project_id TEXT,
+            task_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE memory_candidates (
+            id TEXT PRIMARY KEY,
+            result_hash TEXT NOT NULL,
+            result_text TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            producer_runtime TEXT NOT NULL,
+            producer_agent TEXT NOT NULL,
+            task_id TEXT,
+            run_id TEXT,
+            state TEXT NOT NULL DEFAULT 'candidate',
+            feedback TEXT NOT NULL DEFAULT '',
+            object_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    create_memory_object(
+        conn,
+        title="Jarvis result",
+        body_text="jarvis compatible result",
+        profile_id="test",
+        task_id="task-legacy",
+        run_id="run-legacy",
+        producer_runtime="local-test",
+    )
+    create_memory_candidate(
+        conn,
+        result_text="legacy failure",
+        profile_id="test",
+        task_id="task-legacy",
+        run_id="run-failed",
+        producer_runtime="local-test",
+    )
+
+    assert len(
+        search_memory(
+            conn,
+            "jarvis",
+            profile_id="test",
+            scopes=["task"],
+            task_id="task-legacy",
+        )
+    ) == 1
+    candidate = conn.execute(
+        "SELECT result_hash,producer_agent,state FROM memory_candidates"
+    ).fetchone()
+    assert len(candidate["result_hash"]) == 64
+    assert candidate["producer_agent"] == "agents-os"
+    assert candidate["state"] == "candidate"
