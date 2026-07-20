@@ -142,8 +142,43 @@ def test_success_terminal_projection_is_atomic_and_memory_is_immediately_searcha
         assert memories[0]["run_id"] == run_id
 
 
+def test_command_is_terminal_when_terminal_projection_is_observed(tmp_path: Path) -> None:
+    coordinator = _coordinator(tmp_path, "success")
+    _, command_id, run_id = _queue(
+        coordinator, tmp_path, marker="command-terminal-observation"
+    )
+
+    assert _wait_for_terminal(coordinator, run_id) == "succeeded"
+
+    with connect(coordinator.paths) as conn:
+        assert execution_projection(conn, run_id)["status"] == "succeeded"
+        assert get_command(conn, command_id)["state"] == "succeeded"
+
+
+def test_jarvis_memory_search_returns_exactly_one_after_success(tmp_path: Path) -> None:
+    coordinator = _coordinator(tmp_path, "success")
+    task_id, _, run_id = _queue(
+        coordinator, tmp_path, marker="jarvis-search-regression"
+    )
+
+    assert _wait_for_terminal(coordinator, run_id) == "succeeded"
+
+    with connect(coordinator.paths) as conn:
+        matches = search_memory(
+            conn,
+            "jarvis",
+            profile_id="test",
+            scopes=["task"],
+            task_id=task_id,
+        )
+        assert len(matches) == 1
+        assert matches[0]["run_id"] == run_id
+
+
 @pytest.mark.parametrize("mode", ["nonzero", "exception"])
-def test_failed_execution_never_leaves_command_running(tmp_path: Path, mode: str) -> None:
+def test_failed_or_exception_execution_never_leaves_command_running(
+    tmp_path: Path, mode: str
+) -> None:
     coordinator = _coordinator(tmp_path, mode)
     task_id, command_id, run_id = _queue(coordinator, tmp_path, marker=f"failure-{mode}")
 
