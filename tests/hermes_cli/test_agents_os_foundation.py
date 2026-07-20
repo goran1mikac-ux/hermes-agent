@@ -33,7 +33,7 @@ def test_connect_creates_minimal_versioned_schema(tmp_path):
             "SELECT value FROM agents_os_meta WHERE key='schema_version'"
         ).fetchone()[0]
 
-    assert tables == {"agents_os_meta"}
+    assert tables == {"agents_os_meta", "tasks", "runs", "events"}
     assert version == SCHEMA_VERSION
     assert paths.db.is_file()
     assert paths.artifacts.is_dir()
