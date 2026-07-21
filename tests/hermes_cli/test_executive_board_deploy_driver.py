@@ -350,6 +350,40 @@ def test_verify_only_checkpoint_remains_loadable(
     assert loaded["status"] == "VERIFY_ONLY_COMPLETE"
 
 
+def test_verify_only_rollback_never_touches_canonical_database(
+    plan: DeployPlan, tmp_path: Path
+) -> None:
+    plan.canonical_db.write_bytes(b"live-canonical-sentinel")
+    before = digest(plan.canonical_db.read_bytes())
+    context = {
+        "plan": plan,
+        "deployment_id": "verify-no-rollback-write",
+        "deployment_dir": str(tmp_path / "deployment"),
+        "mode": DeployMode.VERIFY_ONLY.value,
+        "checkpoint": {
+            "mode": DeployMode.VERIFY_ONLY.value,
+            "completed_states": [State.CANONICAL_MIGRATION.value],
+            "failed_state": State.VERIFY_ONLY.value,
+            "records": [],
+        },
+        "approval": None,
+    }
+    result = RealBackend(timeout=1).run_state(State.ROLLBACK, context)
+    assert result["logical"] is False
+    assert digest(plan.canonical_db.read_bytes()) == before
+    assert not plan.target_venv.exists()
+
+
+def test_verify_only_explicit_rollback_is_blocked_without_false_rollback_claim(
+    plan: DeployPlan, tmp_path: Path
+) -> None:
+    root = tmp_path / "state"
+    deployment = DeploymentDriver(plan, root, FakeBackend())
+    deployment.run(DeployMode.VERIFY_ONLY, "verify-explicit-rollback")
+    result = deployment.rollback("verify-explicit-rollback")
+    assert result["status"] == "BLOCKED"
+
+
 def test_resume_from_non_resumable_checkpoint_is_rejected(plan: DeployPlan, tmp_path: Path) -> None:
     root = tmp_path / "state"
     DeploymentDriver(plan, root, FakeBackend()).run(DeployMode.DRY_RUN, "complete")

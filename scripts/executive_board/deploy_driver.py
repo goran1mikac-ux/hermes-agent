@@ -1172,7 +1172,10 @@ class RealBackend:
                 os.kill(int(pid), signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        logical = State.CANONICAL_MIGRATION.value in checkpoint.get("completed_states", []) or checkpoint.get("failed_state") == State.CANONICAL_MIGRATION.value
+        logical = DeployMode(context["mode"]) != DeployMode.VERIFY_ONLY and (
+            State.CANONICAL_MIGRATION.value in checkpoint.get("completed_states", [])
+            or checkpoint.get("failed_state") == State.CANONICAL_MIGRATION.value
+        )
         if logical:
             if not venv.exists():
                 raise DriverError("logical rollback cannot run: staged venv missing")
@@ -1429,12 +1432,13 @@ class DeploymentDriver:
         checkpoint["completed_states"].append(State.COMPLETE.value)
         checkpoint["current_state"] = State.COMPLETE.value
         checkpoint["next_state"] = None
-        canonical_may_have_changed = (
+        checkpoint_mode = DeployMode(checkpoint["mode"])
+        canonical_may_have_changed = checkpoint_mode != DeployMode.VERIFY_ONLY and (
             State.CANONICAL_MIGRATION.value in checkpoint.get("completed_states", [])
             or (
                 checkpoint.get("failed_state") == State.CANONICAL_MIGRATION.value
                 and (
-                    DeployMode(checkpoint["mode"]) == DeployMode.DRY_RUN
+                    checkpoint_mode == DeployMode.DRY_RUN
                     or checkpoint.get("approval_digest") is not None
                 )
             )
