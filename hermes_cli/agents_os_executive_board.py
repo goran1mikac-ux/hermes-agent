@@ -10,12 +10,24 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-EXECUTIVE_BOARD_SCHEMA_VERSION = "2"
+EXECUTIVE_BOARD_SCHEMA_VERSION = "3"
 _SCHEMA_META_KEY = "executive_board_schema_version"
 _TABLE = "executive_board_items"
 _NONCE_TABLE = "executive_board_consumed_nonces"
+_MEETING_TABLE = "executive_board_meetings"
+_PROPOSAL_TABLE = "executive_board_proposals"
+_CHALLENGE_TABLE = "executive_board_challenges"
+_EVENT_TABLE = "executive_board_lifecycle_events"
+_OWNED_TABLES = (
+    _EVENT_TABLE,
+    _CHALLENGE_TABLE,
+    _PROPOSAL_TABLE,
+    _MEETING_TABLE,
+    _TABLE,
+    _NONCE_TABLE,
+)
 _LOCAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _PAYLOAD_FIELDS = frozenset(
     {
@@ -46,6 +58,14 @@ class PayloadValidationError(ValueError):
 
 class ApprovalRejected(PermissionError):
     pass
+
+
+class InvalidBoardTransition(RuntimeError):
+    """Raised before any write when a lifecycle transition is not allowed."""
+
+
+class ExecutiveBoardMigrationError(RuntimeError):
+    """Raised without mutation when Board schema provenance is inconsistent."""
 
 
 @dataclass(frozen=True)
@@ -220,6 +240,7 @@ class ExecutiveBoardExecutionGate:
         context: ExecutionContext,
         *,
         now: datetime | None = None,
+        authorized_write: Callable[[], None] | None = None,
     ) -> None:
         canonical = canonicalize_action_payload(payload)
         checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -260,13 +281,67 @@ class ExecutiveBoardExecutionGate:
                     "VALUES (?, ?, ?)",
                     (approval.nonce_hash, approval.approval_id, checked_at.isoformat()),
                 )
+                if authorized_write is not None:
+                    authorized_write()
         except sqlite3.IntegrityError as exc:
-            raise reject("nonce already consumed") from exc
+            consumed = self.conn.execute(
+                f"SELECT 1 FROM {_NONCE_TABLE} WHERE nonce_hash=?",
+                (approval.nonce_hash,),
+            ).fetchone()
+            reason = "nonce already consumed" if consumed else "atomic approval transition failed"
+            raise reject(reason) from exc
 
 
 class BoardItemKind(str, Enum):
     RECOMMENDATION = "recommendation"
     ACTION_REQUEST = "action_request"
+
+
+class BoardMeetingState(str, Enum):
+    COLLECTING_PROPOSALS = "collecting_proposals"
+    CHALLENGING = "challenging"
+    CHALLENGED = "challenged"
+    DELIBERATED = "deliberated"
+    RECOMMENDED = "recommended"
+    OWNER_APPROVED = "owner_approved"
+    ACTION_REQUESTED = "action_requested"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class BoardMeeting:
+    meeting_id: str
+    title: str
+    state: BoardMeetingState
+    created_at: str
+    consensus: bool | None = None
+    dissent: str | None = None
+    recommendation_id: str | None = None
+    recommendation_payload_hash: str | None = None
+    recommendation_evidence_hash: str | None = None
+    owner_payload_hash: str | None = None
+    owner_approval_id: str | None = None
+    executor_id: str | None = None
+    action_request_id: str | None = None
+    closure_evidence_hash: str | None = None
+    closed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class BlindProposal:
+    proposal_id: str
+    payload_hash: str
+    evidence_hash: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class BoardLifecycleEvent:
+    event_type: str
+    actor_id: str
+    payload_hash: str | None
+    evidence_hash: str | None
+    created_at: str
 
 
 def canonical_board_id(kind: BoardItemKind, local_id: str) -> str:
@@ -333,8 +408,86 @@ class ExecutiveBoardRollbackPlan:
     present_meta_keys: tuple[str, ...]
 
 
+_V2_SCHEMA_COLUMNS = {
+    _TABLE: ("canonical_id", "kind", "title", "body", "created_at"),
+    _NONCE_TABLE: ("nonce_hash", "approval_id", "consumed_at"),
+}
+_V3_SCHEMA_COLUMNS = {
+    **_V2_SCHEMA_COLUMNS,
+    _MEETING_TABLE: (
+        "meeting_id", "title", "state", "created_at", "consensus", "dissent",
+        "recommendation_id", "recommendation_payload_hash",
+        "recommendation_evidence_hash", "owner_payload_hash", "owner_approval_id",
+        "executor_id", "action_request_id", "closure_evidence_hash", "closed_at",
+    ),
+    _PROPOSAL_TABLE: (
+        "meeting_id", "proposal_id", "proposer_id", "payload_hash",
+        "evidence_hash", "created_at",
+    ),
+    _CHALLENGE_TABLE: (
+        "meeting_id", "challenger_proposal_id", "target_proposal_id",
+        "challenge_hash", "evidence_hash", "created_at",
+    ),
+    _EVENT_TABLE: (
+        "event_id", "meeting_id", "event_type", "actor_id", "payload_hash",
+        "evidence_hash", "created_at",
+    ),
+}
+
+
+def _board_table_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name LIKE 'executive_board_%'"
+        ).fetchall()
+    }
+
+
+def _validate_schema_shape(
+    conn: sqlite3.Connection, expected: Mapping[str, tuple[str, ...]]
+) -> None:
+    actual_tables = _board_table_names(conn)
+    expected_tables = set(expected)
+    if actual_tables != expected_tables:
+        raise ExecutiveBoardMigrationError(
+            "Executive Board table set mismatch: "
+            f"expected {sorted(expected_tables)!r}, got {sorted(actual_tables)!r}"
+        )
+    for table, expected_columns in expected.items():
+        actual_columns = tuple(
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?) ORDER BY cid", (table,)
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            raise ExecutiveBoardMigrationError(
+                f"Executive Board column mismatch for {table}: "
+                f"expected {expected_columns!r}, got {actual_columns!r}"
+            )
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Add the Executive Board schema without changing foundation data."""
+    """Install v3 or upgrade a validated v2 schema without touching foundation data."""
+    version_row = conn.execute(
+        "SELECT value FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,)
+    ).fetchone()
+    current_version = None if version_row is None else str(version_row[0])
+    if current_version == EXECUTIVE_BOARD_SCHEMA_VERSION:
+        _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
+        return
+    if current_version not in (None, "2"):
+        raise ExecutiveBoardMigrationError(
+            f"unsupported schema version: {current_version!r}"
+        )
+    if current_version == "2":
+        _validate_schema_shape(conn, _V2_SCHEMA_COLUMNS)
+    elif _board_table_names(conn):
+        raise ExecutiveBoardMigrationError(
+            "Executive Board tables exist without schema metadata"
+        )
     with conn:
         conn.execute(
             """
@@ -348,11 +501,6 @@ def migrate(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute(
-            "INSERT INTO agents_os_meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (_SCHEMA_META_KEY, EXECUTIVE_BOARD_SCHEMA_VERSION),
-        )
-        conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_NONCE_TABLE} (
                 nonce_hash TEXT PRIMARY KEY,
@@ -360,6 +508,86 @@ def migrate(conn: sqlite3.Connection) -> None:
                 consumed_at TEXT NOT NULL
             )
             """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_MEETING_TABLE} (
+                meeting_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'collecting_proposals', 'challenging', 'challenged',
+                    'deliberated', 'recommended', 'owner_approved',
+                    'action_requested', 'closed'
+                )),
+                created_at TEXT NOT NULL,
+                consensus INTEGER CHECK (consensus IN (0, 1)),
+                dissent TEXT,
+                recommendation_id TEXT,
+                recommendation_payload_hash TEXT,
+                recommendation_evidence_hash TEXT,
+                owner_payload_hash TEXT,
+                owner_approval_id TEXT,
+                executor_id TEXT,
+                action_request_id TEXT,
+                closure_evidence_hash TEXT,
+                closed_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_PROPOSAL_TABLE} (
+                meeting_id TEXT NOT NULL,
+                proposal_id TEXT NOT NULL,
+                proposer_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (meeting_id, proposal_id),
+                UNIQUE (meeting_id, proposer_id),
+                FOREIGN KEY (meeting_id) REFERENCES {_MEETING_TABLE}(meeting_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_CHALLENGE_TABLE} (
+                meeting_id TEXT NOT NULL,
+                challenger_proposal_id TEXT NOT NULL,
+                target_proposal_id TEXT NOT NULL,
+                challenge_hash TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (meeting_id, challenger_proposal_id, target_proposal_id),
+                FOREIGN KEY (meeting_id, challenger_proposal_id)
+                    REFERENCES {_PROPOSAL_TABLE}(meeting_id, proposal_id),
+                FOREIGN KEY (meeting_id, target_proposal_id)
+                    REFERENCES {_PROPOSAL_TABLE}(meeting_id, proposal_id),
+                CHECK (challenger_proposal_id <> target_proposal_id)
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_EVENT_TABLE} (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload_hash TEXT,
+                evidence_hash TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (meeting_id) REFERENCES {_MEETING_TABLE}(meeting_id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
+        conn.execute(
+            "INSERT INTO agents_os_meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_SCHEMA_META_KEY, EXECUTIVE_BOARD_SCHEMA_VERSION),
         )
 
 
@@ -404,6 +632,426 @@ class ExecutiveBoardStore:
         )
 
 
+def _require_local_id(value: str, field: str) -> str:
+    if not isinstance(value, str) or not _LOCAL_ID.fullmatch(value):
+        raise ValueError(f"{field} must contain only letters, digits, '.', '_' or '-'")
+    return value
+
+
+def _require_sha256(value: str, field: str) -> str:
+    if not isinstance(value, str) or not _SHA256_EVIDENCE.fullmatch(value):
+        raise ValueError(f"{field} must be a lowercase sha256 digest")
+    return value
+
+
+class ExecutiveBoardLifecycle:
+    """Persistent, fail-closed lifecycle for one local Executive Board meeting."""
+
+    def __init__(self, conn: sqlite3.Connection, proof_verifier: Any) -> None:
+        self.conn = conn
+        self.proof_verifier = proof_verifier
+        migrate(conn)
+
+    def _meeting(self, meeting_id: str) -> BoardMeeting:
+        _require_local_id(meeting_id, "meeting_id")
+        row = self.conn.execute(
+            f"SELECT * FROM {_MEETING_TABLE} WHERE meeting_id=?", (meeting_id,)
+        ).fetchone()
+        if row is None:
+            raise InvalidBoardTransition("meeting does not exist")
+        return BoardMeeting(
+            meeting_id=row["meeting_id"],
+            title=row["title"],
+            state=BoardMeetingState(row["state"]),
+            created_at=row["created_at"],
+            consensus=None if row["consensus"] is None else bool(row["consensus"]),
+            dissent=row["dissent"],
+            recommendation_id=row["recommendation_id"],
+            recommendation_payload_hash=row["recommendation_payload_hash"],
+            recommendation_evidence_hash=row["recommendation_evidence_hash"],
+            owner_payload_hash=row["owner_payload_hash"],
+            owner_approval_id=row["owner_approval_id"],
+            executor_id=row["executor_id"],
+            action_request_id=row["action_request_id"],
+            closure_evidence_hash=row["closure_evidence_hash"],
+            closed_at=row["closed_at"],
+        )
+
+    def _require_state(self, meeting_id: str, *allowed: BoardMeetingState) -> BoardMeeting:
+        meeting = self._meeting(meeting_id)
+        if meeting.state not in allowed:
+            expected = ", ".join(item.value for item in allowed)
+            raise InvalidBoardTransition(
+                f"meeting state {meeting.state.value!r} does not allow transition; expected {expected}"
+            )
+        return meeting
+
+    def _event(
+        self,
+        meeting_id: str,
+        event_type: str,
+        *,
+        actor_id: str,
+        created_at: str,
+        payload_hash: str | None = None,
+        evidence_hash: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            f"INSERT INTO {_EVENT_TABLE} "
+            "(meeting_id,event_type,actor_id,payload_hash,evidence_hash,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (meeting_id, event_type, actor_id, payload_hash, evidence_hash, created_at),
+        )
+
+    def create_meeting(self, meeting_id: str, title: str, *, created_at: str) -> BoardMeeting:
+        _require_local_id(meeting_id, "meeting_id")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("title must not be empty")
+        _parse_timestamp(created_at, "created_at")
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"INSERT INTO {_MEETING_TABLE}(meeting_id,title,state,created_at) "
+                    "VALUES (?,?,?,?)",
+                    (meeting_id, title.strip(), BoardMeetingState.COLLECTING_PROPOSALS.value, created_at),
+                )
+                self._event(meeting_id, "meeting_created", actor_id="board", created_at=created_at)
+        except sqlite3.IntegrityError as exc:
+            raise InvalidBoardTransition("meeting already exists") from exc
+        return self._meeting(meeting_id)
+
+    def submit_blind_proposal(
+        self,
+        meeting_id: str,
+        *,
+        proposal_id: str,
+        proposer_id: str,
+        payload_hash: str,
+        evidence_hash: str,
+        created_at: str,
+    ) -> BlindProposal:
+        self._require_state(meeting_id, BoardMeetingState.COLLECTING_PROPOSALS)
+        _require_local_id(proposal_id, "proposal_id")
+        _require_local_id(proposer_id, "proposer_id")
+        _require_sha256(payload_hash, "payload_hash")
+        _require_sha256(evidence_hash, "evidence_hash")
+        _parse_timestamp(created_at, "created_at")
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"INSERT INTO {_PROPOSAL_TABLE} "
+                    "(meeting_id,proposal_id,proposer_id,payload_hash,evidence_hash,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (meeting_id, proposal_id, proposer_id, payload_hash, evidence_hash, created_at),
+                )
+                self._event(
+                    meeting_id,
+                    "blind_proposal_submitted",
+                    actor_id="blind",
+                    created_at=created_at,
+                    payload_hash=payload_hash,
+                    evidence_hash=evidence_hash,
+                )
+        except sqlite3.IntegrityError as exc:
+            raise InvalidBoardTransition("proposal id or proposer already used") from exc
+        return BlindProposal(proposal_id, payload_hash, evidence_hash, created_at)
+
+    def list_blind_proposals(self, meeting_id: str) -> tuple[BlindProposal, ...]:
+        self._meeting(meeting_id)
+        rows = self.conn.execute(
+            f"SELECT proposal_id,payload_hash,evidence_hash,created_at "
+            f"FROM {_PROPOSAL_TABLE} WHERE meeting_id=? ORDER BY proposal_id",
+            (meeting_id,),
+        ).fetchall()
+        return tuple(BlindProposal(*tuple(row)) for row in rows)
+
+    def challenge(
+        self,
+        meeting_id: str,
+        *,
+        challenger_proposal_id: str,
+        target_proposal_id: str,
+        challenge_hash: str,
+        evidence_hash: str,
+        created_at: str,
+    ) -> None:
+        self._require_state(
+            meeting_id,
+            BoardMeetingState.COLLECTING_PROPOSALS,
+            BoardMeetingState.CHALLENGING,
+        )
+        _require_local_id(challenger_proposal_id, "challenger_proposal_id")
+        _require_local_id(target_proposal_id, "target_proposal_id")
+        if challenger_proposal_id == target_proposal_id:
+            raise InvalidBoardTransition("a proposal cannot challenge itself")
+        _require_sha256(challenge_hash, "challenge_hash")
+        _require_sha256(evidence_hash, "evidence_hash")
+        _parse_timestamp(created_at, "created_at")
+        proposal_ids = {
+            row[0]
+            for row in self.conn.execute(
+                f"SELECT proposal_id FROM {_PROPOSAL_TABLE} WHERE meeting_id=?",
+                (meeting_id,),
+            ).fetchall()
+        }
+        if len(proposal_ids) < 2:
+            raise InvalidBoardTransition("at least two blind proposals are required")
+        if {challenger_proposal_id, target_proposal_id} - proposal_ids:
+            raise InvalidBoardTransition("challenge references an unknown proposal")
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"INSERT INTO {_CHALLENGE_TABLE} "
+                    "(meeting_id,challenger_proposal_id,target_proposal_id,challenge_hash,evidence_hash,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (meeting_id, challenger_proposal_id, target_proposal_id, challenge_hash, evidence_hash, created_at),
+                )
+                self._event(
+                    meeting_id,
+                    "challenge_recorded",
+                    actor_id=challenger_proposal_id,
+                    created_at=created_at,
+                    payload_hash=challenge_hash,
+                    evidence_hash=evidence_hash,
+                )
+                count = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {_CHALLENGE_TABLE} WHERE meeting_id=?",
+                    (meeting_id,),
+                ).fetchone()[0]
+                expected = len(proposal_ids) * (len(proposal_ids) - 1)
+                state = BoardMeetingState.CHALLENGED if count == expected else BoardMeetingState.CHALLENGING
+                self.conn.execute(
+                    f"UPDATE {_MEETING_TABLE} SET state=? WHERE meeting_id=?",
+                    (state.value, meeting_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise InvalidBoardTransition("challenge direction already recorded") from exc
+
+    def record_deliberation(
+        self,
+        meeting_id: str,
+        *,
+        consensus: bool,
+        dissent: str | None,
+        actor_id: str,
+        created_at: str,
+    ) -> None:
+        meeting = self._meeting(meeting_id)
+        if meeting.state is not BoardMeetingState.CHALLENGED:
+            raise InvalidBoardTransition("complete bidirectional challenges are required")
+        if not isinstance(consensus, bool):
+            raise ValueError("consensus must be a boolean")
+        if not consensus and (not isinstance(dissent, str) or not dissent.strip()):
+            raise InvalidBoardTransition("non-consensus requires documented dissent")
+        if consensus and dissent not in (None, ""):
+            raise InvalidBoardTransition("consensus cannot carry dissent")
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("actor_id must not be empty")
+        _parse_timestamp(created_at, "created_at")
+        normalized_dissent = None if consensus else str(dissent).strip()
+        event_type = "consensus_recorded" if consensus else "dissent_recorded"
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE {_MEETING_TABLE} SET state=?,consensus=?,dissent=? WHERE meeting_id=?",
+                (BoardMeetingState.DELIBERATED.value, int(consensus), normalized_dissent, meeting_id),
+            )
+            self._event(meeting_id, event_type, actor_id=actor_id, created_at=created_at)
+
+    def record_recommendation(
+        self,
+        meeting_id: str,
+        *,
+        local_id: str,
+        title: str,
+        body: str,
+        evidence_hash: str,
+        created_at: str,
+    ) -> BoardItem:
+        meeting = self._require_state(meeting_id, BoardMeetingState.DELIBERATED)
+        _require_sha256(evidence_hash, "evidence_hash")
+        item = BoardItem.create(
+            kind=BoardItemKind.RECOMMENDATION,
+            local_id=local_id,
+            title=title,
+            body=body,
+            created_at=created_at,
+        )
+        material = json.dumps(
+            {
+                "meeting_id": meeting_id,
+                "title": item.title,
+                "body": item.body,
+                "consensus": meeting.consensus,
+                "dissent": meeting.dissent,
+                "evidence_hash": evidence_hash,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        payload_hash = "sha256:" + hashlib.sha256(material).hexdigest()
+        with self.conn:
+            self.conn.execute(
+                f"INSERT INTO {_TABLE}(canonical_id,kind,title,body,created_at) VALUES(?,?,?,?,?)",
+                (item.canonical_id, item.kind.value, item.title, item.body, item.created_at),
+            )
+            self.conn.execute(
+                f"UPDATE {_MEETING_TABLE} SET state=?,recommendation_id=?,"
+                "recommendation_payload_hash=?,recommendation_evidence_hash=? WHERE meeting_id=?",
+                (
+                    BoardMeetingState.RECOMMENDED.value,
+                    item.canonical_id,
+                    payload_hash,
+                    evidence_hash,
+                    meeting_id,
+                ),
+            )
+            self._event(
+                meeting_id,
+                "recommendation_recorded",
+                actor_id="board",
+                created_at=created_at,
+                payload_hash=payload_hash,
+                evidence_hash=evidence_hash,
+            )
+        return item
+
+    def owner_decide(
+        self,
+        meeting_id: str,
+        payload: Mapping[str, Any],
+        approval: ApprovalRecord,
+        context: ExecutionContext,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        meeting = self._require_state(meeting_id, BoardMeetingState.RECOMMENDED)
+        try:
+            parameters = payload["normalized_parameters"]
+            valid_binding = (
+                payload["action_type"] == "executive_board.owner_decision"
+                and payload["target"] == meeting_id
+                and parameters == {
+                    "decision": "approved",
+                    "recommendation_payload_hash": meeting.recommendation_payload_hash,
+                }
+                and payload["evidence_hash"] == meeting.recommendation_evidence_hash
+            )
+        except (KeyError, TypeError):
+            valid_binding = False
+        if not valid_binding:
+            raise ApprovalRejected("owner decision is not bound to the current recommendation")
+        canonical = canonicalize_action_payload(payload)
+        checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+        def apply_owner_decision() -> None:
+            self.conn.execute(
+                f"UPDATE {_MEETING_TABLE} SET state=?,owner_payload_hash=?,owner_approval_id=?,executor_id=? "
+                "WHERE meeting_id=?",
+                (
+                    BoardMeetingState.OWNER_APPROVED.value,
+                    canonical.sha256,
+                    approval.approval_id,
+                    context.executor_id,
+                    meeting_id,
+                ),
+            )
+            self._event(
+                meeting_id,
+                "owner_approved",
+                actor_id="goran",
+                created_at=checked_at.isoformat(),
+                payload_hash=canonical.sha256,
+                evidence_hash=payload["evidence_hash"],
+            )
+
+        ExecutiveBoardExecutionGate(self.conn, self.proof_verifier).authorize_and_consume(
+            payload,
+            approval,
+            context,
+            now=now,
+            authorized_write=apply_owner_decision,
+        )
+
+    def create_action_request(
+        self,
+        meeting_id: str,
+        *,
+        local_id: str,
+        title: str,
+        body: str,
+        created_at: str,
+    ) -> BoardItem:
+        meeting = self._require_state(meeting_id, BoardMeetingState.OWNER_APPROVED)
+        if not meeting.owner_payload_hash or not meeting.owner_approval_id:
+            raise InvalidBoardTransition("owner approval evidence is missing")
+        item = BoardItem.create(
+            kind=BoardItemKind.ACTION_REQUEST,
+            local_id=local_id,
+            title=title,
+            body=body,
+            created_at=created_at,
+        )
+        with self.conn:
+            self.conn.execute(
+                f"INSERT INTO {_TABLE}(canonical_id,kind,title,body,created_at) VALUES(?,?,?,?,?)",
+                (item.canonical_id, item.kind.value, item.title, item.body, item.created_at),
+            )
+            self.conn.execute(
+                f"UPDATE {_MEETING_TABLE} SET state=?,action_request_id=? WHERE meeting_id=?",
+                (BoardMeetingState.ACTION_REQUESTED.value, item.canonical_id, meeting_id),
+            )
+            self._event(
+                meeting_id,
+                "action_request_created",
+                actor_id="goran",
+                created_at=created_at,
+                payload_hash=meeting.owner_payload_hash,
+                evidence_hash=meeting.recommendation_evidence_hash,
+            )
+        return item
+
+    def close_task(
+        self,
+        meeting_id: str,
+        *,
+        actor_id: str,
+        evidence_hash: str,
+        created_at: str,
+    ) -> None:
+        meeting = self._require_state(meeting_id, BoardMeetingState.ACTION_REQUESTED)
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("actor_id must not be empty")
+        if actor_id != meeting.executor_id:
+            raise InvalidBoardTransition("task closure requires the approved executor")
+        _require_sha256(evidence_hash, "evidence_hash")
+        _parse_timestamp(created_at, "created_at")
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE {_MEETING_TABLE} SET state=?,closure_evidence_hash=?,closed_at=? WHERE meeting_id=?",
+                (BoardMeetingState.CLOSED.value, evidence_hash, created_at, meeting_id),
+            )
+            self._event(
+                meeting_id,
+                "task_closed",
+                actor_id=actor_id,
+                created_at=created_at,
+                evidence_hash=evidence_hash,
+            )
+
+    def get_meeting(self, meeting_id: str) -> BoardMeeting:
+        return self._meeting(meeting_id)
+
+    def list_events(self, meeting_id: str) -> tuple[BoardLifecycleEvent, ...]:
+        self._meeting(meeting_id)
+        rows = self.conn.execute(
+            f"SELECT event_type,actor_id,payload_hash,evidence_hash,created_at "
+            f"FROM {_EVENT_TABLE} WHERE meeting_id=? ORDER BY event_id",
+            (meeting_id,),
+        ).fetchall()
+        return tuple(BoardLifecycleEvent(*tuple(row)) for row in rows)
+
+
 def rollback_plan(conn: sqlite3.Connection) -> ExecutiveBoardRollbackPlan:
     """Inspect what rollback would remove; this function performs no writes."""
     meta_table_present = conn.execute(
@@ -415,11 +1063,11 @@ def rollback_plan(conn: sqlite3.Connection) -> ExecutiveBoardRollbackPlan:
             "SELECT 1 FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,)
         ).fetchone()
     return ExecutiveBoardRollbackPlan(
-        tables=(_TABLE, _NONCE_TABLE),
+        tables=_OWNED_TABLES,
         meta_keys=(_SCHEMA_META_KEY,),
         present_tables=tuple(
             table
-            for table in (_TABLE, _NONCE_TABLE)
+            for table in _OWNED_TABLES
             if conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
@@ -431,8 +1079,8 @@ def rollback_plan(conn: sqlite3.Connection) -> ExecutiveBoardRollbackPlan:
 def rollback(conn: sqlite3.Connection) -> None:
     """Idempotently remove only schema and metadata owned by this slice."""
     with conn:
-        conn.execute(f"DROP TABLE IF EXISTS {_TABLE}")
-        conn.execute(f"DROP TABLE IF EXISTS {_NONCE_TABLE}")
+        for table in _OWNED_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
         meta_table_present = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents_os_meta'"
         ).fetchone()

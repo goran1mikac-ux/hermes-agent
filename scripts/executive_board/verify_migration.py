@@ -156,7 +156,14 @@ def verify_migration_copy(
             "AND name LIKE 'executive_board_%' ORDER BY name"
         )
     ]
-    expected_tables = ["executive_board_consumed_nonces", "executive_board_items"]
+    expected_tables = [
+        "executive_board_challenges",
+        "executive_board_consumed_nonces",
+        "executive_board_items",
+        "executive_board_lifecycle_events",
+        "executive_board_meetings",
+        "executive_board_proposals",
+    ]
     if board_tables != expected_tables:
         raise DatabaseVerificationError(f"Executive Board table mismatch: {board_tables!r}")
     conn.commit()

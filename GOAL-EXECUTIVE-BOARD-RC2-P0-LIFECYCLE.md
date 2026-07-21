@@ -1,0 +1,3 @@
+# /goal — Executive Board RC2 P0 lifecycle
+
+Implementiraj minimalni persistent fail-closed lifecycle: meeting → najmanje dva blind prijedloga → bidirectional challenges → consensus ili obvezni dissent → recommendation s evidence hashom → Goran owner decision vezan uz canonical payload hash → action request tek nakon valjanog approvala → task closure event. Odbij replay, tamper, expiry, self-approval i svaki nevaljani prijelaz bez promjene stanja. Radi strict TDD u RC2 worktreeju, koristi samo izolirane DB kopije i privremeni venv, zatim zatvori source/installed/clean-CWD/migration/rollback/reproducible-wheel/manifest gateove. Ne diraj aktivni runtime, canonical DB, servise ni 18791.

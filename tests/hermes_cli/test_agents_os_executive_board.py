@@ -9,6 +9,7 @@ import pytest
 from hermes_cli.agents_os import connect, resolve_paths
 from hermes_cli.agents_os_executive_board import (
     EXECUTIVE_BOARD_SCHEMA_VERSION,
+    ExecutiveBoardMigrationError,
     BoardItem,
     BoardItemKind,
     ApprovalRecord,
@@ -176,6 +177,95 @@ def test_migration_is_idempotent_and_preserves_existing_data(tmp_path):
     conn.close()
 
 
+def test_migration_upgrades_real_v2_schema_and_preserves_rows(tmp_path):
+    conn = sqlite3.connect(tmp_path / "v2.sqlite")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE agents_os_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO agents_os_meta VALUES ('schema_version', '1');
+        INSERT INTO agents_os_meta VALUES ('executive_board_schema_version', '2');
+        CREATE TABLE executive_board_items (
+            canonical_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('recommendation', 'action_request')),
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE executive_board_consumed_nonces (
+            nonce_hash TEXT PRIMARY KEY,
+            approval_id TEXT NOT NULL,
+            consumed_at TEXT NOT NULL
+        );
+        INSERT INTO executive_board_items VALUES
+            ('executive-board:recommendation:legacy', 'recommendation', 'Keep', 'Preserved', '2026-07-21T00:00:00+00:00');
+        INSERT INTO executive_board_consumed_nonces VALUES
+            ('sha256:legacy', 'approval-legacy', '2026-07-21T00:00:01+00:00');
+        """
+    )
+
+    migrate(conn)
+    migrate(conn)
+
+    assert conn.execute(
+        "SELECT value FROM agents_os_meta WHERE key='executive_board_schema_version'"
+    ).fetchone()[0] == "3"
+    assert conn.execute("SELECT title FROM executive_board_items").fetchone()[0] == "Keep"
+    assert conn.execute("SELECT approval_id FROM executive_board_consumed_nonces").fetchone()[0] == "approval-legacy"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'executive_board_%'"
+    ).fetchone()[0] == 6
+    conn.close()
+
+
+def test_migration_rejects_future_version_without_overwriting_metadata(tmp_path):
+    conn = sqlite3.connect(tmp_path / "future.sqlite")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE agents_os_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO agents_os_meta VALUES ('executive_board_schema_version', '4');
+        """
+    )
+
+    with pytest.raises(ExecutiveBoardMigrationError, match="unsupported schema version"):
+        migrate(conn)
+
+    assert conn.execute(
+        "SELECT value FROM agents_os_meta WHERE key='executive_board_schema_version'"
+    ).fetchone()[0] == "4"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'executive_board_%'"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_migration_rejects_incomplete_v3_schema_instead_of_repairing_it(tmp_path):
+    conn = sqlite3.connect(tmp_path / "incomplete-v3.sqlite")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE agents_os_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO agents_os_meta VALUES ('executive_board_schema_version', '3');
+        CREATE TABLE executive_board_items (
+            canonical_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
+    with pytest.raises(ExecutiveBoardMigrationError, match="table set mismatch"):
+        migrate(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'executive_board_%'"
+    ).fetchone()[0] == 1
+    conn.close()
+
+
 def test_rollback_plan_is_read_only_and_rollback_removes_only_board_schema(tmp_path):
     with connect(resolve_paths(home=tmp_path / "profile")) as conn:
         conn.execute("CREATE TABLE preexisting_data (value TEXT NOT NULL)")
@@ -187,11 +277,19 @@ def test_rollback_plan_is_read_only_and_rollback_removes_only_board_schema(tmp_p
 
         assert conn.total_changes == before
         assert plan.tables == (
+            "executive_board_lifecycle_events",
+            "executive_board_challenges",
+            "executive_board_proposals",
+            "executive_board_meetings",
             "executive_board_items",
             "executive_board_consumed_nonces",
         )
         assert plan.meta_keys == ("executive_board_schema_version",)
         assert plan.present_tables == (
+            "executive_board_lifecycle_events",
+            "executive_board_challenges",
+            "executive_board_proposals",
+            "executive_board_meetings",
             "executive_board_items",
             "executive_board_consumed_nonces",
         )
@@ -203,7 +301,7 @@ def test_rollback_plan_is_read_only_and_rollback_removes_only_board_schema(tmp_p
             "SELECT value FROM agents_os_meta WHERE key='schema_version'"
         ).fetchone()[0] == "1"
         assert conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='executive_board_items'"
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'executive_board_%'"
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM agents_os_meta WHERE key='executive_board_schema_version'"
