@@ -240,7 +240,7 @@ class ExecutiveBoardExecutionGate:
         context: ExecutionContext,
         *,
         now: datetime | None = None,
-        authorized_write: Callable[[], None] | None = None,
+        authorized_write: Callable[[sqlite3.Connection], None] | None = None,
     ) -> None:
         canonical = canonicalize_action_payload(payload)
         checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -274,22 +274,31 @@ class ExecutiveBoardExecutionGate:
             raise reject("executable manifest/build hash mismatch")
         if context.circuit_breaker_closed is not True:
             raise reject("circuit breaker is open")
+        if self.conn.in_transaction:
+            raise reject("approval gate requires transaction ownership")
         try:
-            with self.conn:
-                self.conn.execute(
-                    f"INSERT INTO {_NONCE_TABLE}(nonce_hash, approval_id, consumed_at) "
-                    "VALUES (?, ?, ?)",
-                    (approval.nonce_hash, approval.approval_id, checked_at.isoformat()),
-                )
-                if authorized_write is not None:
-                    authorized_write()
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.execute(
+                f"INSERT INTO {_NONCE_TABLE}(nonce_hash, approval_id, consumed_at) "
+                "VALUES (?, ?, ?)",
+                (approval.nonce_hash, approval.approval_id, checked_at.isoformat()),
+            )
+            if authorized_write is not None:
+                authorized_write(self.conn)
+            self.conn.commit()
         except sqlite3.IntegrityError as exc:
+            if self.conn.in_transaction:
+                self.conn.rollback()
             consumed = self.conn.execute(
                 f"SELECT 1 FROM {_NONCE_TABLE} WHERE nonce_hash=?",
                 (approval.nonce_hash,),
             ).fetchone()
             reason = "nonce already consumed" if consumed else "atomic approval transition failed"
             raise reject(reason) from exc
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
 
 class BoardItemKind(str, Enum):
@@ -469,11 +478,41 @@ def _validate_schema_shape(
             )
 
 
-def migrate(conn: sqlite3.Connection) -> None:
-    """Install v3 or upgrade a validated v2 schema without touching foundation data."""
+def _meta_table_present(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents_os_meta'"
+    ).fetchone() is not None
+
+
+def verify_migrated_schema(conn: sqlite3.Connection) -> None:
+    """Verify schema shape and database health without changing transaction state."""
+    if not _meta_table_present(conn):
+        raise ExecutiveBoardMigrationError("agents_os_meta is missing")
     version_row = conn.execute(
         "SELECT value FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,)
     ).fetchone()
+    if version_row is None or str(version_row[0]) != EXECUTIVE_BOARD_SCHEMA_VERSION:
+        raise ExecutiveBoardMigrationError("Executive Board schema version mismatch")
+    _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
+    if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise ExecutiveBoardMigrationError("database integrity check failed")
+    if conn.execute("PRAGMA foreign_key_check").fetchall():
+        raise ExecutiveBoardMigrationError("database foreign-key check failed")
+
+
+def migrate_schema(
+    conn: sqlite3.Connection,
+    *,
+    fault_hook: Callable[[str], None] | None = None,
+) -> None:
+    """Transaction-neutral v3 schema primitive; caller owns commit or rollback."""
+    if not conn.in_transaction:
+        raise ExecutiveBoardMigrationError("migration caller must own an active transaction")
+    version_row = None
+    if _meta_table_present(conn):
+        version_row = conn.execute(
+            "SELECT value FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,)
+        ).fetchone()
     current_version = None if version_row is None else str(version_row[0])
     if current_version == EXECUTIVE_BOARD_SCHEMA_VERSION:
         _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
@@ -488,8 +527,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         raise ExecutiveBoardMigrationError(
             "Executive Board tables exist without schema metadata"
         )
-    with conn:
-        conn.execute(
+    hook = fault_hook or (lambda _stage: None)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agents_os_meta ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    hook("after:agents_os_meta")
+    conn.execute(
             """
             CREATE TABLE IF NOT EXISTS executive_board_items (
                 canonical_id TEXT PRIMARY KEY,
@@ -499,8 +543,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 created_at TEXT NOT NULL
             )
             """
-        )
-        conn.execute(
+    )
+    hook("after:executive_board_items")
+    conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_NONCE_TABLE} (
                 nonce_hash TEXT PRIMARY KEY,
@@ -508,8 +553,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 consumed_at TEXT NOT NULL
             )
             """
-        )
-        conn.execute(
+    )
+    hook(f"after:{_NONCE_TABLE}")
+    conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_MEETING_TABLE} (
                 meeting_id TEXT PRIMARY KEY,
@@ -533,8 +579,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 closed_at TEXT
             )
             """
-        )
-        conn.execute(
+    )
+    hook(f"after:{_MEETING_TABLE}")
+    conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_PROPOSAL_TABLE} (
                 meeting_id TEXT NOT NULL,
@@ -549,8 +596,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                     ON DELETE CASCADE
             )
             """
-        )
-        conn.execute(
+    )
+    hook(f"after:{_PROPOSAL_TABLE}")
+    conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_CHALLENGE_TABLE} (
                 meeting_id TEXT NOT NULL,
@@ -567,8 +615,9 @@ def migrate(conn: sqlite3.Connection) -> None:
                 CHECK (challenger_proposal_id <> target_proposal_id)
             )
             """
-        )
-        conn.execute(
+    )
+    hook(f"after:{_CHALLENGE_TABLE}")
+    conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_EVENT_TABLE} (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -582,13 +631,31 @@ def migrate(conn: sqlite3.Connection) -> None:
                     ON DELETE CASCADE
             )
             """
-        )
-        _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
-        conn.execute(
-            "INSERT INTO agents_os_meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (_SCHEMA_META_KEY, EXECUTIVE_BOARD_SCHEMA_VERSION),
-        )
+    )
+    hook(f"after:{_EVENT_TABLE}")
+    _validate_schema_shape(conn, _V3_SCHEMA_COLUMNS)
+    conn.execute(
+        "INSERT INTO agents_os_meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_SCHEMA_META_KEY, EXECUTIVE_BOARD_SCHEMA_VERSION),
+    )
+    hook("after:schema_version")
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Install v3 atomically for legacy callers while preserving caller transactions."""
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        migrate_schema(conn)
+        verify_migrated_schema(conn)
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
 
 
 class ExecutiveBoardStore:
@@ -944,8 +1011,8 @@ class ExecutiveBoardLifecycle:
         canonical = canonicalize_action_payload(payload)
         checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
-        def apply_owner_decision() -> None:
-            self.conn.execute(
+        def apply_owner_decision(transaction: sqlite3.Connection) -> None:
+            transaction.execute(
                 f"UPDATE {_MEETING_TABLE} SET state=?,owner_payload_hash=?,owner_approval_id=?,executor_id=? "
                 "WHERE meeting_id=?",
                 (
@@ -1076,13 +1143,59 @@ def rollback_plan(conn: sqlite3.Connection) -> ExecutiveBoardRollbackPlan:
     )
 
 
-def rollback(conn: sqlite3.Connection) -> None:
-    """Idempotently remove only schema and metadata owned by this slice."""
-    with conn:
-        for table in _OWNED_TABLES:
+def rollback_schema(
+    conn: sqlite3.Connection,
+    *,
+    baseline_meta_present: bool,
+    baseline_version: str | None,
+) -> None:
+    """Transaction-neutral inverse for the recorded pre-migration baseline."""
+    if not conn.in_transaction:
+        raise ExecutiveBoardMigrationError("rollback caller must own an active transaction")
+    if baseline_version == EXECUTIVE_BOARD_SCHEMA_VERSION:
+        verify_migrated_schema(conn)
+        return
+    if baseline_version == "2":
+        for table in (_EVENT_TABLE, _CHALLENGE_TABLE, _PROPOSAL_TABLE, _MEETING_TABLE):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
-        meta_table_present = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents_os_meta'"
-        ).fetchone()
-        if meta_table_present:
-            conn.execute("DELETE FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,))
+        _validate_schema_shape(conn, _V2_SCHEMA_COLUMNS)
+        conn.execute(
+            "INSERT INTO agents_os_meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (_SCHEMA_META_KEY, "2"),
+        )
+        return
+    if baseline_version is not None:
+        raise ExecutiveBoardMigrationError(
+            f"unsupported rollback baseline version: {baseline_version!r}"
+        )
+    for table in _OWNED_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    if _meta_table_present(conn):
+        conn.execute("DELETE FROM agents_os_meta WHERE key=?", (_SCHEMA_META_KEY,))
+        if not baseline_meta_present:
+            remaining = conn.execute("SELECT COUNT(*) FROM agents_os_meta").fetchone()[0]
+            if remaining:
+                raise ExecutiveBoardMigrationError(
+                    "new metadata table contains unexpected non-Board rows"
+                )
+            conn.execute("DROP TABLE agents_os_meta")
+
+
+def rollback(conn: sqlite3.Connection) -> None:
+    """Legacy atomic rollback preserving the preexisting foundation meta table."""
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        rollback_schema(
+            conn,
+            baseline_meta_present=True,
+            baseline_version=None,
+        )
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+        raise

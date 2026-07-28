@@ -457,3 +457,44 @@ def test_nonce_consumption_is_atomic_and_replay_is_rejected(tmp_path):
         assert conn.execute(
             "SELECT COUNT(*) FROM executive_board_consumed_nonces"
         ).fetchone()[0] == 1
+
+
+def test_execution_gate_rejects_preexisting_transaction_without_committing_it(tmp_path):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    approval = _approval(verifier)
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        gate = ExecutiveBoardExecutionGate(conn, verifier)
+        conn.execute("CREATE TABLE caller_owned(value TEXT)")
+        conn.commit()
+        conn.execute("BEGIN")
+        conn.execute("INSERT INTO caller_owned(value) VALUES ('uncommitted')")
+        with pytest.raises(ApprovalRejected, match="transaction ownership"):
+            gate.authorize_and_consume(_payload(), approval, _context(), now=NOW)
+        assert conn.in_transaction is True
+        conn.rollback()
+        assert conn.execute("SELECT COUNT(*) FROM caller_owned").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executive_board_consumed_nonces"
+        ).fetchone()[0] == 0
+
+
+def test_execution_gate_rolls_back_nonce_and_authorized_write_together(tmp_path):
+    verifier = HMACLocalProofVerifier(b"fixture-only-secret")
+    approval = _approval(verifier)
+    with connect(resolve_paths(home=tmp_path / "profile")) as conn:
+        conn.execute("CREATE TABLE protected_effect(value TEXT)")
+        conn.commit()
+
+        def failing_write(transaction):
+            transaction.execute("INSERT INTO protected_effect(value) VALUES ('partial')")
+            raise RuntimeError("injected failure")
+
+        gate = ExecutiveBoardExecutionGate(conn, verifier)
+        with pytest.raises(RuntimeError, match="injected failure"):
+            gate.authorize_and_consume(
+                _payload(), approval, _context(), now=NOW, authorized_write=failing_write
+            )
+        assert conn.execute("SELECT COUNT(*) FROM protected_effect").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executive_board_consumed_nonces"
+        ).fetchone()[0] == 0
