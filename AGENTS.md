@@ -209,6 +209,11 @@ Auto-loads when you work under `ui-tui/` or `tui_gateway/`.
 
 ## Adding New Tools
 
+> Agent-facing operational reference (plugin-vs-core decision, profile-aware
+> paths). The full human contributor walkthrough — self-registration example,
+> toolset wiring, PR checklist — is the canonical version in `CONTRIBUTING.md`
+> § "Adding a New Tool". Keep detail in one place: extend there, not here.
+
 For most custom or local-only tools, do **not** edit Hermes core. Use the plugin
 route instead: create `~/.hermes/plugins/<name>/plugin.yaml` and
 `~/.hermes/plugins/<name>/__init__.py`, then register tools with
@@ -256,6 +261,10 @@ The registry handles schema collection, dispatch, availability checking, and err
 ---
 
 ## Dependency Pinning Policy
+
+> Quick reference for the agent. The canonical version — full rationale,
+> ceiling-selection guidance, and worked ✅/❌ examples — lives in
+> `CONTRIBUTING.md` § "Dependency Pinning". Keep the authoritative detail there.
 
 All dependencies must have upper bounds to limit supply-chain attack surface.
 This policy was established after the litellm compromise (PR #2796, #2810) and
