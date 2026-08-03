@@ -43,10 +43,20 @@ hermes_cli/skin_engine.py    # SkinConfig dataclass, built-in skins, YAML loader
 
 ## Built-in skins
 
-- `default` — Classic Hermes gold/kawaii (the current look)
-- `ares` — Crimson/bronze war-god theme with custom spinner wings
-- `mono` — Clean grayscale monochrome
-- `slate` — Cool blue developer-focused theme
+Defined in `_BUILTIN_SKINS` in `hermes_cli/skin_engine.py` — that dict is the
+source of truth for the current set (don't hand-maintain a list here; it drifts).
+
+**Visual reference:** `hermes_cli/skins_reference.html` renders every built-in
+skin with its actual palette, spinner faces, and branding. Open it in a browser.
+It is generated — regenerate after changing a skin:
+
+```bash
+python scripts/gen_skins_reference.py   # rewrites hermes_cli/skins_reference.html
+```
+
+A color palette is exactly the kind of reference that reads better as HTML than
+as a markdown table (you see the swatches), and generating it from the code
+keeps it from going stale the way a hand-written list does.
 
 ## Adding a built-in skin
 
